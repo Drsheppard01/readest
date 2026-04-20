@@ -1,10 +1,12 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Virtuoso, VirtuosoHandle, Components } from 'react-virtuoso';
+import { Virtuoso, VirtuosoHandle } from 'react-virtuoso';
+import { useOverlayScrollbars } from 'overlayscrollbars-react';
+import 'overlayscrollbars/overlayscrollbars.css';
 
 import { TOCItem } from '@/libs/document';
 import { useReaderStore } from '@/store/readerStore';
 import { useSidebarStore } from '@/store/sidebarStore';
-import { findParentPath } from '@/utils/toc';
+import { findParentPath } from '@/services/nav';
 import { eventDispatcher } from '@/utils/event';
 import { useTextTranslation } from '../../hooks/useTextTranslation';
 import { FlatTOCItem, StaticListRow } from './TOCItem';
@@ -32,12 +34,22 @@ const computeExpandedSet = (toc: TOCItem[], href: string | undefined): Set<strin
   return new Set([...topLevel, ...parents]);
 };
 
-const TOCScroller = React.forwardRef<HTMLDivElement, React.HTMLAttributes<HTMLDivElement>>(
-  (props, ref) => <div {...props} ref={ref} className='toc-scroller' />,
-);
-TOCScroller.displayName = 'TOCScroller';
+const setsHaveSameContents = (a: Set<string>, b: Set<string>): boolean => {
+  if (a.size !== b.size) return false;
+  for (const item of a) if (!b.has(item)) return false;
+  return true;
+};
 
-const VIRTUOSO_COMPONENTS: Components = { Scroller: TOCScroller };
+const getInitialScrollTarget = (
+  toc: TOCItem[],
+  href: string | undefined,
+): { index: number; expanded: Set<string> } => {
+  const expanded = computeExpandedSet(toc, href);
+  if (!href) return { index: 0, expanded };
+  const flat = flattenTOC(toc, expanded);
+  const idx = flat.findIndex((f) => f.item.href === href);
+  return { index: idx > 0 ? idx : 0, expanded };
+};
 
 const TOCView: React.FC<{
   bookKey: string;
@@ -48,9 +60,8 @@ const TOCView: React.FC<{
   const progress = getProgress(bookKey);
   const isEink = !!getViewSettings(bookKey)?.isEink;
 
-  const [expandedItems, setExpandedItems] = useState<Set<string>>(() =>
-    computeExpandedSet(toc, progress?.sectionHref),
-  );
+  const [initialScrollTarget] = useState(() => getInitialScrollTarget(toc, progress?.sectionHref));
+  const [expandedItems, setExpandedItems] = useState<Set<string>>(initialScrollTarget.expanded);
   const [containerHeight, setContainerHeight] = useState(400);
 
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -59,6 +70,44 @@ const TOCView: React.FC<{
   const scrollCooldownRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pendingScrollRef = useRef(false);
   const visibleCenterRef = useRef(0);
+  const initialScrollHandledRef = useRef(initialScrollTarget.index > 0);
+
+  // OverlayScrollbars + Virtuoso integration (same pattern as Bookshelf)
+  const osRootRef = useRef<HTMLDivElement>(null);
+  const [scroller, setScroller] = useState<HTMLElement | null>(null);
+  const [initialize, osInstance] = useOverlayScrollbars({
+    defer: true,
+    options: { scrollbars: { autoHide: 'scroll' } },
+    events: {
+      initialized(instance) {
+        const { viewport } = instance.elements();
+        viewport.style.overflowX = 'var(--os-viewport-overflow-x)';
+        viewport.style.overflowY = 'var(--os-viewport-overflow-y)';
+        const target = initialScrollTarget.index;
+        if (target > 0) {
+          requestAnimationFrame(() => {
+            virtuosoRef.current?.scrollToIndex({
+              index: target,
+              align: 'center',
+              behavior: 'auto',
+            });
+          });
+        }
+      },
+    },
+  });
+
+  useEffect(() => {
+    const root = osRootRef.current;
+    if (scroller && root) {
+      initialize({ target: root, elements: { viewport: scroller } });
+    }
+    return () => osInstance()?.destroy();
+  }, [scroller, initialize, osInstance]);
+
+  const handleScrollerRef = useCallback((el: HTMLElement | Window | null) => {
+    setScroller(el instanceof HTMLElement ? el : null);
+  }, []);
 
   useTextTranslation(bookKey, containerRef.current, false, 'translation-target-toc');
 
@@ -123,56 +172,69 @@ const TOCView: React.FC<{
       return;
     }
     if (userScrolledRef.current) return;
-    setExpandedItems(computeExpandedSet(toc, progress?.sectionHref));
-    if (progress?.sectionHref) pendingScrollRef.current = true;
+    setExpandedItems((prev) => {
+      const next = computeExpandedSet(toc, progress?.sectionHref);
+      return setsHaveSameContents(prev, next) ? prev : next;
+    });
+    if (progress?.sectionHref) {
+      if (initialScrollHandledRef.current) {
+        initialScrollHandledRef.current = false;
+      } else {
+        pendingScrollRef.current = true;
+      }
+    }
   }, [isSideBarVisible, sideBarBookKey, bookKey, toc, progress]);
 
   useEffect(() => {
     if (!pendingScrollRef.current || !activeHref || !isSideBarVisible) return;
-    const timer = setTimeout(() => {
-      const idx = flatItems.findIndex((f) => f.item.href === activeHref);
-      if (idx !== -1) {
-        // Eink displays ghost previous frames during smooth JS scroll
-        // animations; force an instant jump to avoid the artifact. A CSS-only
-        // fix is impossible because scrollTo({ behavior: 'smooth' }) overrides
-        // CSS scroll-behavior and is not a CSS transition.
-        const distance = Math.abs(idx - visibleCenterRef.current);
-        const behavior = isEink || distance > 16 ? 'auto' : 'smooth';
-        virtuosoRef.current?.scrollToIndex({ index: idx, align: 'center', behavior });
-      }
-      pendingScrollRef.current = false;
-    }, 100);
-    return () => clearTimeout(timer);
+    const idx = flatItems.findIndex((f) => f.item.href === activeHref);
+    if (idx !== -1) {
+      // Eink displays ghost previous frames during smooth JS scroll
+      // animations; force an instant jump to avoid the artifact. A CSS-only
+      // fix is impossible because scrollTo({ behavior: 'smooth' }) overrides
+      // CSS scroll-behavior and is not a CSS transition.
+      const distance = Math.abs(idx - visibleCenterRef.current);
+      const behavior = isEink || distance > 16 ? 'auto' : 'smooth';
+      virtuosoRef.current?.scrollToIndex({ index: idx, align: 'center', behavior });
+    }
+    pendingScrollRef.current = false;
   }, [flatItems, activeHref, isSideBarVisible, isEink]);
 
   return (
     <div ref={containerRef} className='toc-list rounded' role='tree'>
-      <Virtuoso
-        ref={virtuosoRef}
-        components={VIRTUOSO_COMPONENTS}
-        rangeChanged={({ startIndex, endIndex }) => {
-          visibleCenterRef.current = Math.floor((startIndex + endIndex) / 2);
-        }}
-        onScroll={() => {
-          userScrolledRef.current = true;
-          if (scrollCooldownRef.current) clearTimeout(scrollCooldownRef.current);
-          scrollCooldownRef.current = setTimeout(() => {
-            userScrolledRef.current = false;
-          }, 10000);
-        }}
-        style={{ height: containerHeight }}
-        totalCount={flatItems.length}
-        itemContent={(index) => (
-          <StaticListRow
-            bookKey={bookKey}
-            flatItem={flatItems[index]!}
-            activeHref={activeHref}
-            onToggleExpand={handleToggleExpand}
-            onItemClick={handleItemClick}
-          />
-        )}
-        overscan={500}
-      />
+      <div ref={osRootRef} data-overlayscrollbars-initialize='' style={{ height: containerHeight }}>
+        <Virtuoso
+          ref={virtuosoRef}
+          scrollerRef={handleScrollerRef}
+          initialTopMostItemIndex={
+            initialScrollTarget.index > 0
+              ? { index: initialScrollTarget.index, align: 'center' }
+              : 0
+          }
+          rangeChanged={({ startIndex, endIndex }) => {
+            visibleCenterRef.current = Math.floor((startIndex + endIndex) / 2);
+          }}
+          onScroll={() => {
+            userScrolledRef.current = true;
+            if (scrollCooldownRef.current) clearTimeout(scrollCooldownRef.current);
+            scrollCooldownRef.current = setTimeout(() => {
+              userScrolledRef.current = false;
+            }, 10000);
+          }}
+          style={{ height: containerHeight }}
+          totalCount={flatItems.length}
+          itemContent={(index) => (
+            <StaticListRow
+              bookKey={bookKey}
+              flatItem={flatItems[index]!}
+              activeHref={activeHref}
+              onToggleExpand={handleToggleExpand}
+              onItemClick={handleItemClick}
+            />
+          )}
+          overscan={500}
+        />
+      </div>
     </div>
   );
 };

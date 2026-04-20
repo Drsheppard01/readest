@@ -134,15 +134,10 @@ const LibraryPageContent = ({ searchParams }: { searchParams: ReadonlyURLSearchP
   const viewSettings = settings.globalViewSettings;
   const demoBooks = useDemoBooks();
   const scrollRef = useRef<HTMLDivElement | null>(null);
-  // Mirror `scrollRef` in state so react-virtuoso's `customScrollParent` (which
-  // only reads the prop once per mount cycle) always sees a real element
-  // rather than `null` on the Bookshelf's first render.
-  const [scrollEl, setScrollEl] = useState<HTMLDivElement | null>(null);
-  const attachScrollRef = useCallback((el: HTMLDivElement | null) => {
+  const handleScrollerRef = useCallback((el: HTMLDivElement | null) => {
     scrollRef.current = el;
-    setScrollEl(el);
   }, []);
-  const containerRef: React.MutableRefObject<HTMLDivElement | null> = useRef(null);
+  const containerRef = useRef<HTMLDivElement | null>(null);
   const pageRef = useRef<HTMLDivElement>(null);
 
   const getScrollKey = (group: string) => `library-scroll-${group || 'all'}`;
@@ -435,7 +430,7 @@ const LibraryPageContent = ({ searchParams }: { searchParams: ReadonlyURLSearchP
       }
     };
 
-    const loadingTimeout = setTimeout(() => setLoading(true), 300);
+    const loadingTimeout = setTimeout(() => setLoading(true), 500);
     const initLibrary = async () => {
       const appService = await envConfig.getAppService();
       const settings = await appService.loadSettings();
@@ -475,6 +470,7 @@ const LibraryPageContent = ({ searchParams }: { searchParams: ReadonlyURLSearchP
       setCheckLastOpenBooks(false);
       isInitiating.current = false;
     };
+    // searchParams is used to tigger parsing OPEN_WITH_FILES
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [searchParams]);
 
@@ -949,18 +945,15 @@ const LibraryPageContent = ({ searchParams }: { searchParams: ReadonlyURLSearchP
       )}
       {showBookshelf &&
         (libraryBooks.some((book) => !book.deletedAt) ? (
-          <div
-            ref={attachScrollRef}
-            aria-label={_('Your Bookshelf')}
-            className='library-scroller flex-grow'
-          >
+          <div aria-label={_('Your Bookshelf')} className='flex min-h-0 flex-grow flex-col'>
             <div
               ref={containerRef}
-              className={clsx('scroll-container drop-zone flex-grow', isDragging && 'drag-over')}
+              className={clsx(
+                'scroll-container drop-zone flex min-h-0 flex-grow flex-col',
+                isDragging && 'drag-over',
+              )}
               style={{
-                paddingTop: '0px',
                 paddingRight: `${insets.right}px`,
-                paddingBottom: `${insets.bottom}px`,
                 paddingLeft: `${insets.left}px`,
               }}
             >
@@ -970,7 +963,7 @@ const LibraryPageContent = ({ searchParams }: { searchParams: ReadonlyURLSearchP
                 isSelectMode={isSelectMode}
                 isSelectAll={isSelectAll}
                 isSelectNone={isSelectNone}
-                scrollParentEl={scrollEl}
+                onScrollerRef={handleScrollerRef}
                 handleImportBooks={handleImportBooksFromFiles}
                 handleBookUpload={handleBookUpload}
                 handleBookDownload={handleBookDownload}
